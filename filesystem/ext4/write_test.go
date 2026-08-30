@@ -3,9 +3,11 @@ package ext4
 import (
 	"bytes"
 	"crypto/rand"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"testing"
 
 	"github.com/diskfs/go-diskfs/backend/file"
@@ -655,5 +657,247 @@ func TestWriteOnExistingImage(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Errorf("e2fsck failed: %v\n%s", err, string(out))
+	}
+}
+
+// createFragmentedFile writes a file whose data ends up in two separate
+// extents: the first chunk allocates extent A, pad files grab the blocks
+// behind it, and the append allocates extent B elsewhere on disk.
+// With the default 1 KiB block size it produces:
+//
+//	extent A: fileBlock 0, count 2  (covers file offsets [0, 2048))
+//	pad files in between
+//	extent B: fileBlock 2, count 8  (covers file offsets [2048, 10240))
+//
+// It returns the file content expected when reading the whole file.
+func createFragmentedFile(t *testing.T, fs *FileSystem, name string, fillA, fillB byte) []byte {
+	t.Helper()
+	blockSize := int(fs.superblock.blockSize)
+	aBlocks, bBlocks := 2, 8
+
+	write := func(p string, data []byte) {
+		f, err := fs.OpenFile(p, os.O_CREATE|os.O_RDWR)
+		if err != nil {
+			t.Fatalf("OpenFile %s: %v", p, err)
+		}
+		if _, err := f.Write(data); err != nil {
+			t.Fatalf("Write %s: %v", p, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close %s: %v", p, err)
+		}
+	}
+
+	write(name, bytes.Repeat([]byte{fillA}, aBlocks*blockSize))
+	for i := 0; i < 3; i++ {
+		write(fmt.Sprintf("/pad-%s-%d.dat", path.Base(name), i), bytes.Repeat([]byte{'P'}, blockSize))
+	}
+	f, err := fs.OpenFile(name, os.O_RDWR)
+	if err != nil {
+		t.Fatalf("OpenFile %s for append: %v", name, err)
+	}
+	if _, err := f.Seek(int64(aBlocks*blockSize), io.SeekStart); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	if _, err := f.Write(bytes.Repeat([]byte{fillB}, bBlocks*blockSize)); err != nil {
+		t.Fatalf("Write append: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// sanity: the file really is fragmented, otherwise the test proves nothing
+	r, err := fs.OpenFile(name, os.O_RDONLY)
+	if err != nil {
+		t.Fatalf("OpenFile %s for inspect: %v", name, err)
+	}
+	filePtr, ok := r.(*File)
+	if !ok {
+		t.Fatalf("expected *File, got %T", r)
+	}
+	exts := filePtr.extents
+	if len(exts) < 2 {
+		t.Fatalf("expected at least 2 extents, got %d: %+v", len(exts), exts)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	content := append(bytes.Repeat([]byte{fillA}, aBlocks*blockSize), bytes.Repeat([]byte{fillB}, bBlocks*blockSize)...)
+	return content
+}
+
+// TestReadUnalignedOffsetFragmented reads a fragmented file at offsets that
+// are NOT multiples of the block size. An extent covers file blocks
+// [fileBlock, fileBlock+count); with the old strict-< skip condition, an
+// extent ending exactly at the read start block was not skipped, which made
+// leftInExtent negative and made make([]byte, n) panic with
+// "makeslice: len out of range" whenever the offset fell inside the block
+// right after an extent's end. Regression test for that panic.
+func TestReadUnalignedOffsetFragmented(t *testing.T) {
+	_, f := testCreateEmptyFile(t, 100*MB)
+	defer f.Close()
+
+	fs, err := Create(file.New(f, false), 100*MB, 0, 512, &Params{})
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	blockSize := int(fs.superblock.blockSize)
+	content := createFragmentedFile(t, fs, "/frag.dat", 'F', 'G')
+
+	// extent A ends at offset 2*blockSize. The vulnerable window is
+	// (2*blockSize, 3*blockSize); a read starting anywhere inside it with a
+	// non-aligned offset used to panic.
+	tests := []struct {
+		name   string
+		offset int64
+	}{
+		{"extent boundary aligned", int64(2 * blockSize)},
+		{"one past boundary", int64(2*blockSize + 1)},
+		{"mid vulnerable block", int64(2*blockSize + blockSize/2)},
+		{"last byte of vulnerable block", int64(3*blockSize - 1)},
+		{"unaligned inside second extent", int64(4*blockSize + 123)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := fs.OpenFile("/frag.dat", os.O_RDONLY)
+			if err != nil {
+				t.Fatalf("OpenFile: %v", err)
+			}
+			defer r.Close()
+			if _, err := r.Seek(tt.offset, io.SeekStart); err != nil {
+				t.Fatalf("Seek: %v", err)
+			}
+			buf := make([]byte, 100)
+			n, err := r.Read(buf)
+			if err != nil && err != io.EOF {
+				t.Fatalf("Read at %d: %v", tt.offset, err)
+			}
+			if n != len(buf) {
+				t.Fatalf("short read at %d: got %d, want %d", tt.offset, n, len(buf))
+			}
+			if !bytes.Equal(buf, content[tt.offset:tt.offset+int64(len(buf))]) {
+				t.Errorf("data mismatch at offset %d", tt.offset)
+			}
+		})
+	}
+}
+
+// TestWriteUnalignedOffsetFragmented is the Write-side twin of
+// TestReadUnalignedOffsetFragmented: writing at an unaligned offset inside
+// the block right after an extent's end used to panic the same way.
+func TestWriteUnalignedOffsetFragmented(t *testing.T) {
+	_, f := testCreateEmptyFile(t, 100*MB)
+	defer f.Close()
+
+	fs, err := Create(file.New(f, false), 100*MB, 0, 512, &Params{})
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	blockSize := int(fs.superblock.blockSize)
+	createFragmentedFile(t, fs, "/frag.dat", 'F', 'G')
+
+	offsets := []int64{
+		int64(2*blockSize + 1),
+		int64(2*blockSize + blockSize/2),
+		int64(3*blockSize - 1),
+		int64(4*blockSize + 123),
+	}
+	for _, off := range offsets {
+		w, err := fs.OpenFile("/frag.dat", os.O_RDWR)
+		if err != nil {
+			t.Fatalf("OpenFile: %v", err)
+		}
+		if _, err := w.Seek(off, io.SeekStart); err != nil {
+			t.Fatalf("Seek: %v", err)
+		}
+		patch := bytes.Repeat([]byte{'X'}, 50)
+		if _, err := w.Write(patch); err != nil {
+			t.Fatalf("Write at %d: %v", off, err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close w: %v", err)
+		}
+
+		r, err := fs.OpenFile("/frag.dat", os.O_RDONLY)
+		if err != nil {
+			t.Fatalf("OpenFile for verify: %v", err)
+		}
+		if _, err := r.Seek(off, io.SeekStart); err != nil {
+			t.Fatalf("Seek verify: %v", err)
+		}
+		got := make([]byte, len(patch))
+		if _, err := r.Read(got); err != nil && err != io.EOF {
+			t.Fatalf("Read verify: %v", err)
+		}
+		if !bytes.Equal(got, patch) {
+			t.Errorf("write at %d not read back correctly", off)
+		}
+		if err := r.Close(); err != nil {
+			t.Fatalf("Close r: %v", err)
+		}
+	}
+}
+
+// TestCopyFileUnalignedChunkFragmented simulates a copy-based rename: a
+// fragmented file larger than one block is copied with a chunk size that is
+// not a multiple of the block size, so read offsets become unaligned. With
+// the old skip condition the second read panicked.
+func TestCopyFileUnalignedChunkFragmented(t *testing.T) {
+	_, f := testCreateEmptyFile(t, 100*MB)
+	defer f.Close()
+
+	fs, err := Create(file.New(f, false), 100*MB, 0, 512, &Params{})
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	content := createFragmentedFile(t, fs, "/src.dat", 'S', 'T')
+
+	dst, err := fs.OpenFile("/src.dat.new", os.O_CREATE|os.O_RDWR)
+	if err != nil {
+		t.Fatalf("OpenFile dst: %v", err)
+	}
+	defer dst.Close()
+	src, err := fs.OpenFile("/src.dat", os.O_RDONLY)
+	if err != nil {
+		t.Fatalf("OpenFile src: %v", err)
+	}
+	defer src.Close()
+
+	// 3000 is not a multiple of the 1024 block size, so the second read
+	// starts at offset 3000, inside the block right after extent A's end.
+	buf := make([]byte, 3000)
+	var copied int64
+	for copied < int64(len(content)) {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, err := dst.Write(buf[:n]); err != nil {
+				t.Fatalf("Write dst: %v", err)
+			}
+			copied += int64(n)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Read src: %v", err)
+		}
+	}
+	if copied != int64(len(content)) {
+		t.Fatalf("copied %d bytes, want %d", copied, len(content))
+	}
+
+	// verify the copy
+	r, err := fs.OpenFile("/src.dat.new", os.O_RDONLY)
+	if err != nil {
+		t.Fatalf("OpenFile copy for verify: %v", err)
+	}
+	defer r.Close()
+	got := make([]byte, len(content))
+	if _, err := r.Read(got); err != nil && err != io.EOF {
+		t.Fatalf("Read copy: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Errorf("copied data mismatch")
 	}
 }
