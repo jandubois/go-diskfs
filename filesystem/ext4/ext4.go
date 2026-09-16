@@ -133,7 +133,10 @@ func (fs *FileSystem) writeDirectory(parentInode *inode, dirBytes []byte) error 
 	if err != nil {
 		return fmt.Errorf("could not read parent extents for directory: %w", err)
 	}
-	if uint64(requiredBlocks) > extents.blockCount() {
+	// where the existing blocks end is what decides whether more are needed, the same
+	// measure allocateExtents uses. A directory with a hole owns fewer blocks than it
+	// spans, and counting what it owns would ask for blocks it already has.
+	if uint64(requiredBlocks) > extents.nextFileBlock() {
 		newExtents, err := fs.allocateExtents(uint64(len(dirBytes)), &extents)
 		if err != nil {
 			return fmt.Errorf("could not allocate disk space for directory: %w", err)
@@ -2220,18 +2223,19 @@ func (fs *FileSystem) allocateExtents(size uint64, previous *extents) (*extents,
 	if remainder > 0 {
 		required++
 	}
-	// 2- see how many blocks already are allocated
+	// 2- see where the file's existing blocks end
 	var allocated uint64
 	if previous != nil {
-		allocated = previous.blockCount()
+		allocated = previous.nextFileBlock()
 	}
-	// 3- if needed, allocate new blocks in extents
-	extraBlockCount := required - allocated
-	newBlocks := extraBlockCount
-	// if we have enough, do not add anything
-	if extraBlockCount <= 0 {
+	// 3- if needed, allocate new blocks in extents.
+	// both counts are unsigned, so compare before subtracting: a file that already
+	// reaches past the requested size would otherwise underflow to an enormous count
+	if required <= allocated {
 		return previous, nil
 	}
+	extraBlockCount := required - allocated
+	newBlocks := extraBlockCount
 
 	// if there are not enough blocks left on the filesystem, return an error
 	if fs.superblock.freeBlocks < extraBlockCount {

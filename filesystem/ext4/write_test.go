@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"testing"
 
 	"github.com/diskfs/go-diskfs/backend/file"
@@ -899,5 +900,129 @@ func TestCopyFileUnalignedChunkFragmented(t *testing.T) {
 	}
 	if !bytes.Equal(got, content) {
 		t.Errorf("copied data mismatch")
+	}
+}
+
+// TestWriteAppendToSparseFile appends to a file whose leading blocks are a
+// hole. Only mke2fs can set that up, because go-diskfs allocates the blocks a
+// hole would occupy.
+func TestWriteAppendToSparseFile(t *testing.T) {
+	mke2fs, err := exec.LookPath("mke2fs")
+	if err != nil {
+		t.Skip("mke2fs not available")
+	}
+	if _, err = exec.LookPath("e2fsck"); err != nil {
+		t.Skip("e2fsck not available")
+	}
+
+	const (
+		size      = 32 * MB
+		blockSize = 4096
+		holeSize  = 16 * blockSize
+	)
+
+	// a source tree holding one file that starts with a hole
+	srcDir := t.TempDir()
+	src, err := os.Create(filepath.Join(srcDir, "sparse.dat"))
+	if err != nil {
+		t.Fatalf("Error creating source file: %v", err)
+	}
+	if _, err = src.WriteAt([]byte("TAIL"), holeSize); err != nil {
+		t.Fatalf("Error writing source file: %v", err)
+	}
+	if err = src.Close(); err != nil {
+		t.Fatalf("Error closing source file: %v", err)
+	}
+
+	outfile, image := testCreateEmptyFile(t, size)
+	if err = image.Close(); err != nil {
+		t.Fatalf("Error closing image file: %v", err)
+	}
+	cmd := exec.Command(mke2fs, "-q", "-F", "-t", "ext4", "-b", "4096", "-d", srcDir, outfile)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err = cmd.Run(); err != nil {
+		t.Fatalf("mke2fs failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+
+	f, err := os.OpenFile(outfile, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("Error opening image: %v", err)
+	}
+	defer f.Close()
+	fs, err := Read(file.New(f, false), size, 0, 512)
+	if err != nil {
+		t.Fatalf("Error reading filesystem: %v", err)
+	}
+	ext4File, err := fs.OpenFile("/sparse.dat", os.O_RDWR|os.O_APPEND)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	sparse, ok := ext4File.(*File)
+	if !ok {
+		t.Fatalf("OpenFile returned %T, expected *File", ext4File)
+	}
+	// the whole test rests on the file starting with a hole. Skipping here instead
+	// would leave the test green having checked nothing.
+	if sparse.extents.nextFileBlock() <= sparse.extents.blockCount() {
+		t.Fatalf("mke2fs did not preserve the hole: the file spans %d blocks and owns %d",
+			sparse.extents.nextFileBlock(), sparse.extents.blockCount())
+	}
+
+	if _, err = ext4File.Write([]byte("APPENDED")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if err = f.Sync(); err != nil {
+		t.Fatalf("Error syncing: %v", err)
+	}
+
+	// the appended bytes belong right after the ones mke2fs wrote
+	if _, err = ext4File.Seek(holeSize, io.SeekStart); err != nil {
+		t.Fatalf("Seek failed: %v", err)
+	}
+	tail := make([]byte, len("TAILAPPENDED"))
+	if _, err = io.ReadFull(ext4File, tail); err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if string(tail) != "TAILAPPENDED" {
+		t.Errorf("read %q at the end of the file, expected %q", tail, "TAILAPPENDED")
+	}
+
+	// that append stayed inside the block the file already owned. Growing the file
+	// past it allocates, which is where blocks numbered from the count of blocks the
+	// file owns would land on top of the extent already there.
+	grown := bytes.Repeat([]byte("G"), 3*blockSize)
+	if _, err = ext4File.Write(grown); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if err = f.Sync(); err != nil {
+		t.Fatalf("Error syncing: %v", err)
+	}
+	next := uint64(holeSize / blockSize)
+	for _, e := range sparse.extents {
+		if uint64(e.fileBlock) < next {
+			t.Errorf("extent at file block %d starts before %d, where the blocks before it end", e.fileBlock, next)
+		}
+		next = uint64(e.fileBlock) + uint64(e.count)
+	}
+	if _, err = ext4File.Seek(holeSize+int64(len("TAILAPPENDED")), io.SeekStart); err != nil {
+		t.Fatalf("Seek failed: %v", err)
+	}
+	readBack := make([]byte, len(grown))
+	if _, err = io.ReadFull(ext4File, readBack); err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if !bytes.Equal(readBack, grown) {
+		t.Errorf("the grown region holds %q..., expected %q...", readBack[:16], grown[:16])
+	}
+
+	cmd = exec.Command("e2fsck", "-f", "-n", outfile)
+	stdout.Reset()
+	stderr.Reset()
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err = cmd.Run(); err != nil {
+		t.Fatalf("e2fsck failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
 	}
 }

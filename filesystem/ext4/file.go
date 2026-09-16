@@ -135,7 +135,7 @@ func (fl *File) Write(b []byte) (int, error) {
 		newBlockCount++
 	}
 	allocatedBlocks := fl.extents.blockCount()
-	if newBlockCount > allocatedBlocks {
+	if newBlockCount > fl.extents.nextFileBlock() {
 		// Calculate the previously accumulated tree metadata blocks so we don't lose them.
 		// fl.blocks (in its current unit) = data blocks + meta blocks from prior writes.
 		var oldMetaBlocks uint64
@@ -160,10 +160,13 @@ func (fl *File) Write(b []byte) (int, error) {
 		}
 		fl.extents = updatedExtents
 		totalMetaBlocks := oldMetaBlocks + metaBlocks
+		// i_blocks counts the blocks the file owns; a file with a hole spans
+		// more blocks than it owns
+		dataBlocks := updatedExtents.blockCount()
 		if fl.filesystemBlocks {
-			fl.blocks = newBlockCount + totalMetaBlocks
+			fl.blocks = dataBlocks + totalMetaBlocks
 		} else {
-			fl.blocks = (newBlockCount + totalMetaBlocks) * blocksize / 512
+			fl.blocks = (dataBlocks + totalMetaBlocks) * blocksize / 512
 		}
 	}
 
