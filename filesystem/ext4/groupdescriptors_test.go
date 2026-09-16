@@ -100,3 +100,37 @@ func TestGroupDescriptorsToBytes(t *testing.T) {
 		t.Errorf("groupDescriptors.toBytes() mismatched, actual then expected\n%s", diffString)
 	}
 }
+
+// TestGroupDescriptorToBytesNon64Bit round-trips a 32-byte group descriptor,
+// the size used by a filesystem without the 64bit feature.
+func TestGroupDescriptorToBytesNon64Bit(t *testing.T) {
+	const hashSeed = 0xa3bf953d
+	expected := &groupDescriptor{
+		size:                            groupDescriptorSize,
+		number:                          2,
+		blockBitmapLocation:             0x101,
+		inodeBitmapLocation:             0x111,
+		inodeTableLocation:              0x121,
+		freeBlocks:                      0x1234,
+		freeInodes:                      0x2345,
+		usedDirectories:                 0x3,
+		snapshotExclusionBitmapLocation: 0x131,
+		blockBitmapChecksum:             0x4567,
+		inodeBitmapChecksum:             0x5678,
+		unusedInodes:                    0x10,
+		flags:                           blockGroupFlags{inodeTableZeroed: true},
+	}
+
+	b := expected.toBytes(gdtChecksumMetadata, hashSeed)
+	if len(b) != int(groupDescriptorSize) {
+		t.Fatalf("groupDescriptor.toBytes() returned %d bytes, expected %d", len(b), groupDescriptorSize)
+	}
+	gd, err := groupDescriptorFromBytes(b, groupDescriptorSize, int(expected.number), gdtChecksumMetadata, hashSeed)
+	if err != nil {
+		t.Fatalf("Error parsing group descriptor: %v", err)
+	}
+	deep.CompareUnexportedFields = true
+	if diff := deep.Equal(gd, expected); diff != nil {
+		t.Errorf("groupDescriptor round trip = %v", diff)
+	}
+}
