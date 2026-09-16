@@ -138,6 +138,9 @@ type inode struct {
 	extents                extentBlockFinder
 	blockPointers          [15]uint32
 	linkTarget             string
+	// ibodyXattrs is the inode tail past the extra fields i_extra_isize declares,
+	// where ext4 keeps small extended attributes such as security.capability.
+	ibodyXattrs string
 }
 
 // deviceNumber extracts the device major/minor from blockPointers using the
@@ -359,6 +362,12 @@ func inodeFromBytes(b []byte, sb *superblock, number uint32) (*inode, error) {
 		}
 	}
 
+	extraIsize := binary.LittleEndian.Uint16(b[0x80:0x82])
+	var ibodyXattrs string
+	if xattrStart := int(ext2InodeSize) + int(extraIsize); xattrStart < len(b) {
+		ibodyXattrs = string(b[xattrStart:])
+	}
+
 	i := inode{
 		number:                 number,
 		permissionsGroup:       parseGroupPermissions(mode),
@@ -374,17 +383,18 @@ func inodeFromBytes(b []byte, sb *superblock, number uint32) (*inode, error) {
 		flags:                  &flags,
 		nfsFileVersion:         iGeneration,
 		version:                binary.LittleEndian.Uint64(version),
-		inodeSize:              binary.LittleEndian.Uint16(b[0x80:0x82]) + minInodeSize,
+		inodeSize:              extraIsize + minInodeSize,
 		deletionTime:           binary.LittleEndian.Uint32(b[0x14:0x18]),
 		accessTime:             time.Unix(atimeSec, atimeNano),
 		changeTime:             time.Unix(ctimeSec, ctimeNano),
 		modifyTime:             time.Unix(mtimeSec, mtimeNano),
 		createTime:             time.Unix(crtimeSec, crtimeNano),
 		extendedAttributeBlock: extendedAttributeBlock,
-		project:                binary.LittleEndian.Uint32(b[0x9c:0x100]),
+		project:                binary.LittleEndian.Uint32(b[0x9c:0xa0]),
 		extents:                allExtents,
 		blockPointers:          blockPointers,
 		linkTarget:             linkTarget,
+		ibodyXattrs:            ibodyXattrs,
 	}
 	checksum := binary.LittleEndian.Uint32(checksumBytes)
 	actualChecksum := inodeChecksum(b, sb.checksumSeed, number, i.nfsFileVersion)
@@ -493,6 +503,10 @@ func (i *inode) toBytes(sb *superblock) []byte {
 	copy(b[0x8c:0x90], accessTime[4:8])
 	copy(b[0x90:0x94], createTime[0:4])
 	copy(b[0x94:0x98], createTime[4:8])
+	copy(b[0x98:0x9c], version[4:8])
+	binary.LittleEndian.PutUint32(b[0x9c:0xa0], i.project)
+	// nothing above writes this region, so copy the attributes back
+	copy(b[len(b)-len(i.ibodyXattrs):], i.ibodyXattrs)
 
 	actualChecksum := inodeChecksum(b, sb.checksumSeed, i.number, i.nfsFileVersion)
 	checksum := make([]byte, 4)
