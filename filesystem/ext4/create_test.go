@@ -533,3 +533,46 @@ func TestCreateWriteReadRoundTrip(t *testing.T) {
 		t.Errorf("round-trip mismatch: wrote %q, read %q", content, readBack)
 	}
 }
+
+// TestCreateWithout64BitFeature exercises a filesystem whose group descriptors
+// are 32 bytes rather than 64, and writes a file so that the group descriptor
+// table is rewritten.
+func TestCreateWithout64BitFeature(t *testing.T) {
+	outfile, f := testCreateEmptyFile(t, 100*MB)
+	defer f.Close()
+	params := &Params{
+		// metadata checksums are what put a checksum in each group descriptor, so
+		// without them e2fsck below has nothing to check the 32-byte ones against
+		Features: []FeatureOpt{WithFeatureFS64Bit(false), WithFeatureMetadataChecksums(true)},
+	}
+	fs, err := Create(file.New(f, false), 100*MB, 0, 512, params)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	if fs.superblock.groupDescriptorSize != groupDescriptorSize {
+		t.Fatalf("group descriptor size is %d, expected %d", fs.superblock.groupDescriptorSize, groupDescriptorSize)
+	}
+	hello, err := fs.OpenFile("/hello.txt", os.O_CREATE|os.O_RDWR)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if _, err := hello.Write([]byte("hello world")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("Error syncing: %v", err)
+	}
+	cmd := exec.Command("e2fsck", "-f", "-n", outfile)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("e2fsck failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	// e2fsck prints a bad group descriptor checksum and still exits 0, so it cannot be
+	// what checks the checksums here. Reading the image back can: the read side rejects
+	// a descriptor whose checksum does not match.
+	if _, err := Read(file.New(f, false), 100*MB, 0, 512); err != nil {
+		t.Fatalf("reading the filesystem back failed: %v", err)
+	}
+}
