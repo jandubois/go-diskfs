@@ -1043,3 +1043,78 @@ func TestExtendExtentTreeLargeFile(t *testing.T) {
 		t.Errorf("e2fsck failed: %v\n%s", err, string(out))
 	}
 }
+
+// TestAllocateExtentsAfterHole checks that blocks added to a file with a hole
+// are numbered from the end of its last extent rather than from the count of
+// blocks it owns, which would overlap the extent already there.
+func TestAllocateExtentsAfterHole(t *testing.T) {
+	fs, _ := setupWritableExtentFS(t, 512*MB)
+	blockSize := uint64(fs.superblock.blockSize)
+
+	// one block of data at file block 16, with file blocks 0 to 15 a hole
+	previous := extents{{fileBlock: 16, startingBlock: 4096, count: 1}}
+	// the block that extent claims is spoken for, so an allocation that hands it
+	// back is a bug this test can see
+	markBlockInUse(t, fs, previous[0].startingBlock)
+
+	// growing the file to 25 blocks needs the 8 blocks that follow the extent
+	added, err := fs.allocateExtents(25*blockSize, &previous)
+	if err != nil {
+		t.Fatalf("allocateExtents failed: %v", err)
+	}
+	if count := added.blockCount(); count != 8 {
+		t.Errorf("allocateExtents allocated %d blocks, expected 8", count)
+	}
+	// the new blocks follow the existing extent, in order and without a gap
+	next := uint64(17)
+	for _, e := range *added {
+		if uint64(e.fileBlock) != next {
+			t.Errorf("extent starts at file block %d, expected %d", e.fileBlock, next)
+		}
+		if e.startingBlock <= previous[0].startingBlock && previous[0].startingBlock < e.startingBlock+uint64(e.count) {
+			t.Errorf("extent at disk block %d covers block %d, which the file already holds", e.startingBlock, previous[0].startingBlock)
+		}
+		next = uint64(e.fileBlock) + uint64(e.count)
+	}
+}
+
+// markBlockInUse sets block in the block bitmap of the group holding it, so that a
+// later allocation cannot hand out the same block.
+func markBlockInUse(t *testing.T, fs *FileSystem, block uint64) {
+	t.Helper()
+	group := int((block - uint64(fs.superblock.firstDataBlock)) / uint64(fs.superblock.blocksPerGroup))
+	groupStart := uint64(fs.superblock.firstDataBlock) + uint64(group)*uint64(fs.superblock.blocksPerGroup)
+	bs, err := fs.readBlockBitmap(group)
+	if err != nil {
+		t.Fatalf("could not read the block bitmap of group %d: %v", group, err)
+	}
+	if err := bs.Set(int(block - groupStart)); err != nil {
+		t.Fatalf("could not mark block %d in use: %v", block, err)
+	}
+	if err := fs.writeBlockBitmap(bs, group); err != nil {
+		t.Fatalf("could not write the block bitmap of group %d: %v", group, err)
+	}
+}
+
+// TestAllocateExtentsBelowExistingSize checks that asking for fewer blocks than the
+// file already spans allocates nothing. required and allocated are unsigned, so a
+// subtraction before that comparison underflows to an enormous count.
+func TestAllocateExtentsBelowExistingSize(t *testing.T) {
+	fs, _ := setupWritableExtentFS(t, 512*MB)
+	blockSize := uint64(fs.superblock.blockSize)
+
+	// one block of data at file block 16, so the file spans 17 blocks and owns 1
+	unchanged := extent{fileBlock: 16, startingBlock: 4096, count: 1}
+	previous := extents{unchanged}
+
+	added, err := fs.allocateExtents(5*blockSize, &previous)
+	if err != nil {
+		t.Fatalf("allocateExtents failed: %v", err)
+	}
+	if added == nil {
+		t.Fatalf("allocateExtents returned no extents")
+	}
+	if len(*added) != 1 || !(*added)[0].equal(&unchanged) {
+		t.Errorf("allocateExtents returned %v, expected the one extent the file already has", *added)
+	}
+}

@@ -52,6 +52,19 @@ func (e extents) blockCount() uint64 {
 	return count
 }
 
+// nextFileBlock returns the file block that follows the last one any extent
+// maps, which is where blocks added to the end of the file belong. A file with
+// a hole maps fewer blocks than it spans, so this is larger than blockCount.
+func (e extents) nextFileBlock() uint64 {
+	var next uint64
+	for _, ext := range e {
+		if end := uint64(ext.fileBlock) + uint64(ext.count); end > next {
+			next = end
+		}
+	}
+	return next
+}
+
 // extentBlockFinder provides a way of finding the blocks on disk that represent the block range of a given file.
 // Arguments are the starting and ending blocks in the file. Returns a slice of blocks to read on disk.
 // These blocks are in order. For example, if you ask to read file blocks starting at 20 for a count of 25, then you might
