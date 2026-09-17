@@ -1324,42 +1324,6 @@ func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 	}, nil
 }
 
-// openFileViaInode opens a file given its path and flags, using the inode directly.
-// Will not create the file if it does not exist.
-// Does not follow symlinks.
-func (fs *FileSystem) openFileViaInode(inodeNumber uint32, flag int) (filesystem.File, error) {
-	inode, err := fs.readInode(inodeNumber)
-	if err != nil {
-		return nil, fmt.Errorf("could not read inode number %d: %v", inodeNumber, err)
-	}
-
-	// if a symlink, read the target, rather than the inode itself, which does not point to anything
-	if inode.fileType == fileTypeSymbolicLink {
-		return nil, fmt.Errorf("cannot open file via inode: inode %d is a symbolic link", inodeNumber)
-	}
-	if inode.extents == nil {
-		return nil, fmt.Errorf("cannot open special file (inode %d): no extent tree", inodeNumber)
-	}
-	offset := int64(0)
-	if flag&os.O_APPEND == os.O_APPEND {
-		offset = int64(inode.size)
-	}
-	// when we open a file, we load the inode but also all of the extents
-	extents, err := inode.extents.blocks(fs)
-	if err != nil {
-		return nil, fmt.Errorf("could not read extent tree for inode %d: %v", inodeNumber, err)
-	}
-	return &File{
-		inode:       inode,
-		isReadWrite: flag&os.O_RDWR != 0,
-		isAppend:    flag&os.O_APPEND != 0,
-		offset:      offset,
-		filesystem:  fs,
-		extents:     extents,
-		fileType:    directoryFileType(inode.fileType),
-	}, nil
-}
-
 // ReadFile implements ReadFileFS to read an entire file into memory
 func (fs *FileSystem) ReadFile(name string) ([]byte, error) {
 	f, err := fs.Open(name)
