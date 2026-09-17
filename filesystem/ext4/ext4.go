@@ -1548,6 +1548,9 @@ func (fs *FileSystem) Remove(p string) error {
 	removedInode.deletionTime = uint32(time.Now().Unix())
 	removedInode.size = 0
 	removedInode.blocks = 0
+	// the attributes in the inode itself are part of the entry being freed, and
+	// rewriting the inode would otherwise copy them back into it
+	removedInode.ibodyXattrs = ""
 	if err := fs.writeInode(removedInode); err != nil {
 		return fmt.Errorf("could not mark removed inode %d as deleted: %v", entry.inode, err)
 	}
