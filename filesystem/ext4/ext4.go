@@ -1293,6 +1293,16 @@ func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 	if inode.extents == nil {
 		return nil, fmt.Errorf("cannot open special file %s (inode %d): no extent tree", p, inodeNumber)
 	}
+	// O_TRUNC needs os.O_RDWR: File.Write refuses any other mode, and os.O_RDONLY is 0,
+	// so truncating on either would empty a file nothing could refill.
+	if flag&os.O_TRUNC == os.O_TRUNC && flag&os.O_RDWR != 0 {
+		if entry.fileType == dirFileTypeDirectory {
+			return nil, fmt.Errorf("cannot truncate directory %s", p)
+		}
+		if err := fs.truncateInode(inode, 0); err != nil {
+			return nil, fmt.Errorf("could not truncate %s: %w", p, err)
+		}
+	}
 	offset := int64(0)
 	if flag&os.O_APPEND == os.O_APPEND {
 		offset = int64(inode.size)
@@ -1311,42 +1321,6 @@ func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 		extents:     extents,
 		filename:    filename,
 		fileType:    entry.fileType,
-	}, nil
-}
-
-// openFileViaInode opens a file given its path and flags, using the inode directly.
-// Will not create the file if it does not exist.
-// Does not follow symlinks.
-func (fs *FileSystem) openFileViaInode(inodeNumber uint32, flag int) (filesystem.File, error) {
-	inode, err := fs.readInode(inodeNumber)
-	if err != nil {
-		return nil, fmt.Errorf("could not read inode number %d: %v", inodeNumber, err)
-	}
-
-	// if a symlink, read the target, rather than the inode itself, which does not point to anything
-	if inode.fileType == fileTypeSymbolicLink {
-		return nil, fmt.Errorf("cannot open file via inode: inode %d is a symbolic link", inodeNumber)
-	}
-	if inode.extents == nil {
-		return nil, fmt.Errorf("cannot open special file (inode %d): no extent tree", inodeNumber)
-	}
-	offset := int64(0)
-	if flag&os.O_APPEND == os.O_APPEND {
-		offset = int64(inode.size)
-	}
-	// when we open a file, we load the inode but also all of the extents
-	extents, err := inode.extents.blocks(fs)
-	if err != nil {
-		return nil, fmt.Errorf("could not read extent tree for inode %d: %v", inodeNumber, err)
-	}
-	return &File{
-		inode:       inode,
-		isReadWrite: flag&os.O_RDWR != 0,
-		isAppend:    flag&os.O_APPEND != 0,
-		offset:      offset,
-		filesystem:  fs,
-		extents:     extents,
-		fileType:    directoryFileType(inode.fileType),
 	}, nil
 }
 
@@ -1436,7 +1410,7 @@ func (fs *FileSystem) Remove(p string) error {
 	for _, e := range extents {
 		for i := e.startingBlock; i < e.startingBlock+uint64(e.count); i++ {
 			// determine what block group this block is in, and read the bitmap for that blockgroup
-			bg := blockGroupForBlock(int(i), fs.superblock.blocksPerGroup)
+			bg := blockGroupForBlock(int(i), fs.superblock.blocksPerGroup, fs.superblock.firstDataBlock)
 			dataBlockBitmap, ok := blockBitmaps[bg]
 			if !ok {
 				dataBlockBitmap, err = fs.readBlockBitmap(bg)
@@ -1584,7 +1558,117 @@ func (fs *FileSystem) Remove(p string) error {
 	return fs.writeSuperblock()
 }
 
+// truncateInode sets the size of the file the inode describes, freeing the blocks
+// that fall past the new size and writing the inode back to disk. Growing a file
+// allocates nothing: the space between the old and the new size is a hole.
+func (fs *FileSystem) truncateInode(in *inode, size uint64) error {
+	if size >= in.size {
+		in.size = size
+		return fs.writeInode(in)
+	}
+	if in.extents == nil {
+		return fmt.Errorf("inode %d has no extent tree", in.number)
+	}
+	// an extent tree deeper than the inode lives in blocks of its own, and freeing
+	// those needs a walk down the tree that this package does not have yet. Shrinking
+	// the file without freeing them would leak them, so refuse instead.
+	if in.extents.getDepth() > 0 {
+		return fmt.Errorf("extent tree of inode %d has internal nodes", in.number)
+	}
+	existing, err := in.extents.blocks(fs)
+	if err != nil {
+		return fmt.Errorf("could not read extents of inode %d: %w", in.number, err)
+	}
+	blockSize := uint64(fs.superblock.blockSize)
+	// ext4 marks an extent uninitialized by setting bit 15 of ee_len, which the parser
+	// does not mask, so such an extent reads as maxBlocksPerExtent blocks longer than it
+	// is. Freeing its tail would free blocks that belong to other files.
+	for _, e := range existing {
+		if e.count > maxBlocksPerExtent {
+			return fmt.Errorf("extent at file block %d of inode %d is uninitialized", e.fileBlock, in.number)
+		}
+	}
+	// the new size needs this many blocks; the rest of the file is freed
+	keptBlocks := (size + blockSize - 1) / blockSize
+	var kept, freed extents
+	for _, e := range existing {
+		firstBlock := uint64(e.fileBlock)
+		pastBlock := firstBlock + uint64(e.count)
+		switch {
+		case firstBlock >= keptBlocks:
+			freed = append(freed, e)
+		case pastBlock <= keptBlocks:
+			kept = append(kept, e)
+		default:
+			// the new size falls inside this extent, so it keeps its head and loses its tail
+			head := uint16(keptBlocks - firstBlock)
+			kept = append(kept, extent{fileBlock: e.fileBlock, startingBlock: e.startingBlock, count: head})
+			freed = append(freed, extent{
+				fileBlock:     uint32(keptBlocks),
+				startingBlock: e.startingBlock + uint64(head),
+				count:         e.count - head,
+			})
+		}
+	}
+	in.extents = extentsBlockFinderFromExtents(kept, fs.superblock.blockSize)
+	in.size = size
+	ownedBlocks := kept.blockCount()
+	// ext4 counts an external extended attribute block among the blocks a file owns
+	if in.extendedAttributeBlock != 0 {
+		ownedBlocks++
+	}
+	if in.filesystemBlocks {
+		in.blocks = ownedBlocks
+	} else {
+		in.blocks = ownedBlocks * blockSize / 512
+	}
+	// write the shortened inode before touching any block. A failure afterwards leaks
+	// the blocks past the new size, where zeroing or freeing first would lose data a
+	// file that kept its old size still covers
+	if err := fs.writeInode(in); err != nil {
+		return err
+	}
+	if err := fs.zeroBlockTail(kept, size); err != nil {
+		return fmt.Errorf("could not zero the tail of inode %d: %w", in.number, err)
+	}
+	if len(freed) > 0 {
+		if err := fs.deallocateExtents(freed); err != nil {
+			return fmt.Errorf("could not free the blocks past the new size of inode %d: %w", in.number, err)
+		}
+	}
+	return nil
+}
+
+// zeroBlockTail zeroes the bytes between size and the end of the block holding it, so
+// that a file grown past size again reads zeros there rather than its former contents.
+func (fs *FileSystem) zeroBlockTail(kept extents, size uint64) error {
+	blockSize := uint64(fs.superblock.blockSize)
+	tail := size % blockSize
+	if tail == 0 {
+		return nil
+	}
+	fileBlock := size / blockSize
+	for _, e := range kept {
+		if fileBlock < uint64(e.fileBlock) || fileBlock >= uint64(e.fileBlock)+uint64(e.count) {
+			continue
+		}
+		writableFile, err := fs.backend.Writable()
+		if err != nil {
+			return err
+		}
+		start := (e.startingBlock + fileBlock - uint64(e.fileBlock)) * blockSize
+		if _, err := writableFile.WriteAt(make([]byte, blockSize-tail), int64(start+tail)); err != nil {
+			return err
+		}
+		return nil
+	}
+	return nil
+}
+
 func (fs *FileSystem) Truncate(p string, size int64) error {
+	if size < 0 {
+		return fmt.Errorf("cannot truncate %s to negative size %d", p, size)
+	}
 	_, entry, err := fs.getEntryAndParent(p)
 	if err != nil {
 		return err
@@ -1595,19 +1679,20 @@ func (fs *FileSystem) Truncate(p string, size int64) error {
 	if entry.fileType == dirFileTypeDirectory {
 		return fmt.Errorf("cannot truncate directory %s", p)
 	}
+	// a symlink target too long for the inode is in a block of its own, which truncating
+	// would free while the link still points at it. POSIX truncates the target instead.
+	if entry.fileType == dirFileTypeSymlink {
+		return fmt.Errorf("cannot truncate symlink %s", p)
+	}
 	// it is not a directory, and it exists, so truncate it
 	inode, err := fs.readInode(entry.inode)
 	if err != nil {
 		return fmt.Errorf("could not read inode %d in directory: %v", entry.inode, err)
 	}
-	// change the file size
-	inode.size = uint64(size)
-
-	// free used blocks if shrank, or reserve new blocks if grew
-	// both of which mean updating the superblock, and the extents tree in the inode
-
-	// write the inode back
-	return fs.writeInode(inode)
+	if err := fs.truncateInode(inode, uint64(size)); err != nil {
+		return fmt.Errorf("could not truncate %s: %w", p, err)
+	}
+	return nil
 }
 
 // getEntryAndParent given a path, get the Directory for the parent and the directory entry for the file.
@@ -2398,7 +2483,7 @@ func (fs *FileSystem) deallocateExtents(toClear extents) error {
 	for _, e := range toClear {
 		// get the block group for the blocks in the extents
 		for block := e.startingBlock; block < e.startingBlock+uint64(e.count); block++ {
-			bg := blockGroupForBlock(int(block), fs.superblock.blocksPerGroup)
+			bg := blockGroupForBlock(int(block), fs.superblock.blocksPerGroup, fs.superblock.firstDataBlock)
 			// clear the block bitmap entries for the blocks in the extents
 			if _, ok := blockBitmaps[bg]; !ok {
 				bs, err := fs.readBlockBitmap(bg)
@@ -3259,8 +3344,8 @@ func groupDescriptorInodeTableBlocks(index int, sb *superblock) uint64 {
 func blockGroupForInode(inodeNumber int, inodesPerGroup uint32) int {
 	return (inodeNumber - 1) / int(inodesPerGroup)
 }
-func blockGroupForBlock(blockNumber int, blocksPerGroup uint32) int {
-	return (blockNumber - 1) / int(blocksPerGroup)
+func blockGroupForBlock(blockNumber int, blocksPerGroup, firstDataBlock uint32) int {
+	return (blockNumber - int(firstDataBlock)) / int(blocksPerGroup)
 }
 
 // given the superblock, build the group descriptors

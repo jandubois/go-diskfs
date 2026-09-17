@@ -59,6 +59,16 @@ func (fl *File) Read(b []byte) (int, error) {
 		if uint64(e.fileBlock)+uint64(e.count) <= readStartBlock {
 			continue
 		}
+		// the file has a hole before this extent, and a hole reads as zeros
+		if gap := int64(e.fileBlock)*int64(blocksize) - fl.offset; gap > 0 {
+			zeros := min(gap, bytesToRead-readBytes)
+			clear(b[readBytes : readBytes+zeros])
+			readBytes += zeros
+			fl.offset += zeros
+			if readBytes >= bytesToRead {
+				break
+			}
+		}
 		// extentSize is the number of bytes on the disk for the extent
 		extentSize := int64(e.count) * int64(blocksize)
 		// where do we start and end in the extent?
@@ -89,6 +99,12 @@ func (fl *File) Read(b []byte) (int, error) {
 		if readBytes >= bytesToRead {
 			break
 		}
+	}
+	// a hole past the last extent reads as zeros too
+	if readBytes < bytesToRead {
+		clear(b[readBytes:bytesToRead])
+		fl.offset += bytesToRead - readBytes
+		readBytes = bytesToRead
 	}
 	var err error
 	if fl.offset >= fileSize {
